@@ -58,6 +58,24 @@ uniform float fADOF_AutofocusRadius <
     ui_category = "Focusing";
 > = 0.6;
 
+uniform int iADOF_AutofocusRadiusMode <
+    ui_type = "combo";
+    ui_label = "Autofocus sample selection";
+	ui_items = "Mean\0Percentile\0";
+	ui_tooltip = "How to use the autofocus radius";
+    ui_category = "Focusing";
+> = 1;
+
+uniform float fADOF_AutofocusSamplePercentile <
+    ui_type = "drag";
+    ui_label = "Autofocus sample percentile";
+    ui_min = 0;
+    ui_max = 0.99;
+    ui_step = 0.01;
+	ui_tooltip = "In percentile mode, which percentile of all samples to use as the focal depth. 0.5 is 50% = the median.";
+    ui_category = "Focusing";
+> = 0.5;
+
 uniform float fADOF_AutofocusSpeed <
     ui_type = "drag";
     ui_min = 0.05;
@@ -238,6 +256,9 @@ uniform float fADOF_ShapeAnamorphRatio <
 #define FPS_HAND_BLUR_CUTOFF_CHECK		0		//blur = max if depth > hand depth, else 0, useful for tweaking above param
 #define GAUSSIAN_BUILDUP_MULT			4.0		//value of x -> gaussian reaches max radius at |CoC| == 1/x
 
+#define FOCUS_SAMPLES 100
+#define FOCUS_SAMPLES_SQRT 10
+
 texture2D ADOF_FocusTex 	    { Format = R16F; };
 texture2D ADOF_FocusTexPrev     { Format = R16F; };
 
@@ -339,6 +360,50 @@ float CircleOfConfusion(float2 texcoord, bool aggressiveLeakReduction)
 	return scenecoc;
 }
 
+int partition(inout float list[FOCUS_SAMPLES], in uint left, in uint right, in uint pivotIndex)
+{
+    float pivotValue = list[pivotIndex];
+    // swap list[pivotIndex] and list[right]
+    list[pivotIndex] = list[right];
+    list[right] = pivotValue;
+    uint storeIndex = left;
+
+    float store;
+    for (uint i = left; i < right; i++)
+    {
+        if (list[i] < pivotValue){
+            // swap list[storeIndex] and list[i]
+            store = list[storeIndex];
+            list[storeIndex] = list[i];
+            list[i] = store;
+
+            storeIndex++;
+        }
+    }
+    // swap list[right] and list[storeIndex]
+    store = list[storeIndex];
+    list[storeIndex] = list[right];
+    list[right] = store;
+
+    return storeIndex;
+}
+
+float quickselect(in float list[FOCUS_SAMPLES], in uint left, in uint right, in uint k)
+{
+    while (left != right)
+    {
+        uint pivotIndex = (right + left) / 2;
+        pivotIndex = partition(list, left, right, pivotIndex);
+        if (k == pivotIndex)
+            return list[k];
+        else if (k < pivotIndex)
+            right = pivotIndex - 1;
+        else
+            left = pivotIndex + 1;
+    }
+    return list[left];
+}
+
 void ShapeRoundness(inout float2 sampleOffset, in float roundness)
 {
 	sampleOffset *= (1.0-roundness) + rsqrt(dot(sampleOffset,sampleOffset))*roundness;
@@ -369,35 +434,57 @@ void PS_ReadFocus(in ADOF_VSOUT IN, out float focus : SV_Target0)
     float scenefocus = 0.0;
 
     [branch]
-	if(bADOF_AutofocusEnable == true)
-	{
-		float samples = 10.0;
-		float weightsum = 1e-6;
+    if(bADOF_AutofocusEnable == true)
+    {
+        float samples = FOCUS_SAMPLES_SQRT;
+        [branch]
+        if (iADOF_AutofocusRadiusMode == 0) 
+        {
+            float weightsum = 1e-6;
 
-		for(float xcoord = 0.0; xcoord < samples; xcoord++)
-		for(float ycoord = 0.0; ycoord < samples; ycoord++)
-		{
-			float2 sampleOffset = (float2(xcoord,ycoord) + 0.5) / samples;
-			sampleOffset = sampleOffset * 2.0 - 1.0;
-			sampleOffset *= fADOF_AutofocusRadius;
-			sampleOffset += (fADOF_AutofocusCenter - 0.5);
+            for(float xcoord = 0.0; xcoord < samples; xcoord++)
+            for(float ycoord = 0.0; ycoord < samples; ycoord++)
+            {
+                float2 sampleOffset = (float2(xcoord,ycoord) + 0.5) / samples;
+                sampleOffset = sampleOffset * 2.0 - 1.0;
+                sampleOffset *= fADOF_AutofocusRadius;
+                sampleOffset += (fADOF_AutofocusCenter - 0.5);
 
-			float sampleWeight = saturate(1.2 * exp2(-dot(sampleOffset,sampleOffset)*4.0));
+                float sampleWeight = saturate(1.2 * exp2(-dot(sampleOffset,sampleOffset)*4.0));
 
-			float tempfocus = GetLinearDepth(sampleOffset * 0.5 + 0.5);
-			sampleWeight *= rcp(tempfocus + 0.001);
+                float tempfocus = GetLinearDepth(sampleOffset * 0.5 + 0.5);
+                sampleWeight *= rcp(tempfocus + 0.001);
 
-			sampleWeight *= saturate(tempfocus > FPS_HAND_BLUR_CUTOFF_DIST * 1e-4); //remove fps hands from focus calculations
+                sampleWeight *= saturate(tempfocus > FPS_HAND_BLUR_CUTOFF_DIST * 1e-4); //remove fps hands from focus calculations
 
-			scenefocus += tempfocus * sampleWeight;
-			weightsum += sampleWeight;
-		}
-		scenefocus /= weightsum;
-	}
-	else
-	{
-		scenefocus = fADOF_ManualfocusDepth * fADOF_ManualfocusDepth;
-	}
+                scenefocus += tempfocus * sampleWeight;
+                weightsum += sampleWeight;
+            }
+            scenefocus /= weightsum;
+        }
+        else 
+        {
+            float sampleDepthArray[FOCUS_SAMPLES];
+            int sampleDepthI = 0;
+
+            for(float xcoord = 0.0; xcoord < samples; xcoord++)
+            for(float ycoord = 0.0; ycoord < samples; ycoord++)
+            {
+                float2 sampleOffset = (float2(xcoord,ycoord) + 0.5) / samples;
+                sampleOffset = sampleOffset * 2.0 - 1.0;
+                sampleOffset *= fADOF_AutofocusRadius;
+                sampleOffset += (fADOF_AutofocusCenter - 0.5);
+
+                sampleDepthArray[sampleDepthI++] = GetLinearDepth(sampleOffset * 0.5 + 0.5);
+            }
+
+            scenefocus = quickselect(sampleDepthArray, 0, FOCUS_SAMPLES - 1, FOCUS_SAMPLES * fADOF_AutofocusSamplePercentile);
+        }
+    }
+    else
+    {
+	scenefocus = fADOF_ManualfocusDepth * fADOF_ManualfocusDepth;
+    }
 
     float prevscenefocus = tex2D(sADOF_FocusTexPrev, 0.5).x;
     float adjustmentspeed = fADOF_AutofocusSpeed * fADOF_AutofocusSpeed;
