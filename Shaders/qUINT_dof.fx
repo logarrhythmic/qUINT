@@ -70,7 +70,7 @@ uniform float fADOF_AutofocusSamplePercentile <
     ui_type = "drag";
     ui_label = "Autofocus sample percentile";
     ui_min = 0;
-    ui_max = 0.99;
+    ui_max = 1.00;
     ui_step = 0.01;
 	ui_tooltip = "In percentile mode, which percentile of all samples to use as the focal depth. 0.5 is 50% = the median.";
     ui_category = "Focusing";
@@ -258,6 +258,7 @@ uniform float fADOF_ShapeAnamorphRatio <
 
 #define FOCUS_SAMPLES 100
 #define FOCUS_SAMPLES_SQRT 10
+#define FOCUS_HISTOGRAM_SIZE 1001
 
 texture2D ADOF_FocusTex 	    { Format = R16F; };
 texture2D ADOF_FocusTexPrev     { Format = R16F; };
@@ -360,48 +361,15 @@ float CircleOfConfusion(float2 texcoord, bool aggressiveLeakReduction)
 	return scenecoc;
 }
 
-int partition(inout float list[FOCUS_SAMPLES], in uint left, in uint right, in uint pivotIndex)
+float histogramKthSample(in uint histogram[FOCUS_HISTOGRAM_SIZE], in uint k)
 {
-    float pivotValue = list[pivotIndex];
-    // swap list[pivotIndex] and list[right]
-    list[pivotIndex] = list[right];
-    list[right] = pivotValue;
-    uint storeIndex = left;
-
-    float store;
-    for (uint i = left; i < right; i++)
+    uint samplesSeen = 0;
+    uint i = 0;
+    while (samplesSeen <= k && i < FOCUS_HISTOGRAM_SIZE)
     {
-        if (list[i] < pivotValue){
-            // swap list[storeIndex] and list[i]
-            store = list[storeIndex];
-            list[storeIndex] = list[i];
-            list[i] = store;
-
-            storeIndex++;
-        }
+        samplesSeen += histogram[i++];
     }
-    // swap list[right] and list[storeIndex]
-    store = list[storeIndex];
-    list[storeIndex] = list[right];
-    list[right] = store;
-
-    return storeIndex;
-}
-
-float quickselect(in float list[FOCUS_SAMPLES], in uint left, in uint right, in uint k)
-{
-    while (left != right)
-    {
-        uint pivotIndex = (right + left) / 2;
-        pivotIndex = partition(list, left, right, pivotIndex);
-        if (k == pivotIndex)
-            return list[k];
-        else if (k < pivotIndex)
-            right = pivotIndex - 1;
-        else
-            left = pivotIndex + 1;
-    }
-    return list[left];
+    return (float)(i - 1) / (float)(FOCUS_HISTOGRAM_SIZE - 1);
 }
 
 void ShapeRoundness(inout float2 sampleOffset, in float roundness)
@@ -462,10 +430,9 @@ void PS_ReadFocus(in ADOF_VSOUT IN, out float focus : SV_Target0)
             }
             scenefocus /= weightsum;
         }
-        else 
+        else
         {
-            float sampleDepthArray[FOCUS_SAMPLES];
-            int sampleDepthI = 0;
+            uint sampleDepthHistogram[FOCUS_HISTOGRAM_SIZE];
 
             for(float xcoord = 0.0; xcoord < samples; xcoord++)
             for(float ycoord = 0.0; ycoord < samples; ycoord++)
@@ -475,10 +442,10 @@ void PS_ReadFocus(in ADOF_VSOUT IN, out float focus : SV_Target0)
                 sampleOffset *= fADOF_AutofocusRadius;
                 sampleOffset += (fADOF_AutofocusCenter - 0.5);
 
-                sampleDepthArray[sampleDepthI++] = GetLinearDepth(sampleOffset * 0.5 + 0.5);
+                sampleDepthHistogram[(int)round( (FOCUS_HISTOGRAM_SIZE - 1) * GetLinearDepth(sampleOffset * 0.5 + 0.5) )]++;
             }
 
-            scenefocus = quickselect(sampleDepthArray, 0, FOCUS_SAMPLES - 1, FOCUS_SAMPLES * fADOF_AutofocusSamplePercentile);
+            scenefocus = histogramKthSample(sampleDepthHistogram, FOCUS_SAMPLES * fADOF_AutofocusSamplePercentile);
         }
     }
     else
